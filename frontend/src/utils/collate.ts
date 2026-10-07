@@ -58,19 +58,34 @@ export interface LossDiffRow {
   lossA: Loss | null;
   /** B 拓本在该字位的损泐 */
   lossB: Loss | null;
-  /** 差异类型：仅 A / 仅 B / 程度不同 / 一致 */
-  diffKind: 'onlyA' | 'onlyB' | 'severity' | 'same';
+  /** 差异类型：仅 A / 仅 B / 程度不同 / 一致 / 已剔除（缺页，不计数） */
+  diffKind: 'onlyA' | 'onlyB' | 'severity' | 'same' | 'excluded';
   severityDelta: number;
+  /** 该字位所在扫描页序（取两侧有记录的页序） */
+  pageSeq: number | null;
+  /** 被剔除原因：A 侧缺页 / B 侧缺页 / 该字位重扫后待复核 */
+  excludedReason: 'missingA' | 'missingB' | null;
+}
+
+export interface LossDiffOptions {
+  /**
+   * 扫描缺页页序集合（按拓本）。
+   * 任一方该页缺页时，这一页上的字位即使损泐对不上也不算差异 ——
+   * 页序缺的那几处不能进差异字数，否则比对结果失真。
+   */
+  missingPagesByRubbing?: Record<string, ReadonlySet<number>>;
 }
 
 export interface LossDiffResult {
   rows: LossDiffRow[];
-  /** 差异字数：仅 A + 仅 B + 程度不同 */
+  /** 差异字数：仅 A + 仅 B + 程度不同（不含已剔除的缺页字位与待复核字位） */
   diffCount: number;
   onlyACount: number;
   onlyBCount: number;
   severityDiffCount: number;
   sameCount: number;
+  /** 因缺页剔除的差异字位数（展示但不进 diffCount） */
+  excludedCount: number;
   /** 涉及的拓本损泐总条数 */
   totalA: number;
   totalB: number;
@@ -85,20 +100,36 @@ function heaviest(list: Loss[]): Loss | null {
 /**
  * 按字位坐标比对两个拓本的损泐集合，输出差异清单与差异计数。
  * 差异定义：一方有损泐另一方没有，或双方损泐严重程度不同。
+ * 扫描缺页（options.missingPagesByRubbing）所在页的字位只展示不计数，
+ * 重扫后挂起待复核的字位同样先挂出、由人工确认，不直接算差异。
  */
-export function diffLosses(lossesA: Loss[], lossesB: Loss[]): LossDiffResult {
+export function diffLosses(
+  lossesA: Loss[],
+  lossesB: Loss[],
+  options: LossDiffOptions = {},
+): LossDiffResult {
+  const activeA = lossesA.filter((loss) => loss.reviewState !== 'pending');
+  const activeB = lossesB.filter((loss) => loss.reviewState !== 'pending');
+  const pendingKeys = new Set(
+    [...pendingLosses(lossesA), ...pendingLosses(lossesB)].map((loss) => coordKey(loss)),
+  );
+  const missingA = options.missingPagesByRubbing?.A ?? new Set<number>();
+  const missingB = options.missingPagesByRubbing?.B ?? new Set<number>();
+
   const mapA = new Map<string, Loss[]>();
   const mapB = new Map<string, Loss[]>();
-  lossesA.forEach((loss) => {
+  activeA.forEach((loss) => {
     const key = coordKey(loss);
     mapA.set(key, [...(mapA.get(key) ?? []), loss]);
   });
-  lossesB.forEach((loss) => {
+  activeB.forEach((loss) => {
     const key = coordKey(loss);
     mapB.set(key, [...(mapB.get(key) ?? []), loss]);
   });
 
-  const keys = Array.from(new Set([...mapA.keys(), ...mapB.keys()])).sort((a, b) => {
+  // 待复核字位即使两侧对不上也先挂出，不进差异集合
+  const allKeys = Array.from(new Set([...mapA.keys(), ...mapB.keys(), ...pendingKeys]));
+  const keys = allKeys.sort((a, b) => {
     const [la, ca] = a.split(':').map((item) => Number.parseInt(item, 10));
     const [lb, cb] = b.split(':').map((item) => Number.parseInt(item, 10));
     if (la !== lb) return (la as number) - (lb as number);
@@ -109,19 +140,34 @@ export function diffLosses(lossesA: Loss[], lossesB: Loss[]): LossDiffResult {
     const [lineNo, charNo] = key.split(':').map((item) => Number.parseInt(item, 10)) as [number, number];
     const lossA = heaviest(mapA.get(key) ?? []);
     const lossB = heaviest(mapB.get(key) ?? []);
+    const pageSeq = lossA?.pageSeq ?? lossB?.pageSeq ?? null;
     const weightA = lossA ? severityWeight(lossA.severity) : 0;
     const weightB = lossB ? severityWeight(lossB.severity) : 0;
     const severityDelta = weightA - weightB;
+    const pageMissingA = pageSeq !== null && missingA.has(pageSeq);
+    const pageMissingB = pageSeq !== null && missingB.has(pageSeq);
+    const isPendingCoord = pendingKeys.has(key);
+
     let diffKind: LossDiffRow['diffKind'] = 'same';
     if (lossA && !lossB) diffKind = 'onlyA';
     else if (!lossA && lossB) diffKind = 'onlyB';
     else if (severityDelta !== 0) diffKind = 'severity';
-    return { key, lineNo, charNo, lossA, lossB, diffKind, severityDelta };
+
+    // 缺页页序上的差异（含一方有损泐另一方该页缺失）一律剔除，不进差异字数
+    const excludedReason: LossDiffRow['excludedReason'] = pageMissingA
+      ? 'missingA'
+      : pageMissingB
+        ? 'missingB'
+        : null;
+    if (excludedReason || (isPendingCoord && diffKind !== 'same')) diffKind = 'excluded';
+
+    return { key, lineNo, charNo, lossA, lossB, diffKind, severityDelta, pageSeq, excludedReason };
   });
 
   const onlyACount = rows.filter((row) => row.diffKind === 'onlyA').length;
   const onlyBCount = rows.filter((row) => row.diffKind === 'onlyB').length;
   const severityDiffCount = rows.filter((row) => row.diffKind === 'severity').length;
+  const excludedCount = rows.filter((row) => row.diffKind === 'excluded').length;
 
   return {
     rows,
@@ -130,9 +176,15 @@ export function diffLosses(lossesA: Loss[], lossesB: Loss[]): LossDiffResult {
     onlyBCount,
     severityDiffCount,
     sameCount: rows.filter((row) => row.diffKind === 'same').length,
+    excludedCount,
     totalA: lossesA.length,
     totalB: lossesB.length,
   };
+}
+
+/** 重扫后挂起待复核的损泐记录（先挂出，不计差异） */
+function pendingLosses(losses: Loss[]): Loss[] {
+  return losses.filter((loss) => loss.reviewState === 'pending');
 }
 
 /**

@@ -44,6 +44,7 @@ import {
   setLossTypes,
   updateLoss,
 } from '@/stores/lossSlice';
+import { resolveLossRecheck, selectScanImages } from '@/stores/scanSlice';
 import {
   LOSS_SEVERITY_COLOR,
   LOSS_SEVERITY_LABEL,
@@ -69,6 +70,7 @@ export default function LossBoard() {
   const steles = useAppSelector(selectSteles);
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
+  const scanImages = useAppSelector(selectScanImages);
 
   const url = useFilterQuery(FILTER_KEYS);
   const [rubbingId, setRubbingId] = useState<string>('');
@@ -129,8 +131,23 @@ export default function LossBoard() {
       blur: count('blur'),
       stoneFlower: count('stoneFlower'),
       heavy: list.filter((loss) => loss.severity === 'heavy').length,
+      pending: list.filter((loss) => loss.reviewState === 'pending').length,
     };
   }, [losses, rubbingId]);
+
+  /** 当前拓本扫描总页序（页序选择器上限） */
+  const pageCount = useMemo(() => {
+    if (!rubbingId) return 1;
+    const seqs = scanImages
+      .filter((image) => image.rubbingId === rubbingId && (image.state === 'attached' || image.state === 'missing'))
+      .map((image) => image.pageSeq);
+    return Math.max(1, ...seqs);
+  }, [rubbingId, scanImages]);
+
+  const excludedKeys = useMemo(
+    () => new Set(diff.excludedRows.map((row) => `${row.lineNo}:${row.charNo}`)),
+    [diff.excludedRows],
+  );
 
   const gridLines = useMemo(() => {
     const list = losses.filter((loss) => loss.rubbingId === rubbingId);
@@ -151,7 +168,7 @@ export default function LossBoard() {
       return;
     }
     setEditing(null);
-    form.setFieldsValue(createEmptyLossDraft(rubbingId, lineNo, charNo));
+    form.setFieldsValue(createEmptyLossDraft(rubbingId, lineNo, charNo, 1));
     setOpen(true);
   };
 
@@ -161,6 +178,7 @@ export default function LossBoard() {
       rubbingId: loss.rubbingId,
       lineNo: loss.lineNo,
       charNo: loss.charNo,
+      pageSeq: loss.pageSeq,
       type: loss.type,
       severity: loss.severity,
       note: loss.note,
@@ -181,9 +199,7 @@ export default function LossBoard() {
   };
 
   const cellLoss = (lineNo: number, charNo: number): Loss | undefined =>
-    losses.find((loss) => loss.rubbingId === rubbingId && loss.lineNo === lineNo && loss.charNo === charNo);
-
-  const columns: ColumnsType<Loss> = [
+    losses.find((loss) => loss.rubbingId === rubbingId && loss.lineNo === lineNo && loss.charNo === charNo);  const columns: ColumnsType<Loss> = [
     {
       title: '字位',
       key: 'coord',
@@ -197,7 +213,7 @@ export default function LossBoard() {
       width: 130,
       render: (value: LossType, record) => <LossTag type={value} severity={record.severity} note={record.note} />,
     },
-    { title: '行 / 字', key: 'line', width: 110, render: (_value, record) => `第 ${record.lineNo} 行 第 ${record.charNo} 字` },
+    { title: '行 / 字 / 页', key: 'line', width: 160, render: (_value, record) => `第 ${record.lineNo} 行 第 ${record.charNo} 字 · 第 ${record.pageSeq} 页` },
     {
       title: '程度',
       dataIndex: 'severity',
@@ -212,13 +228,38 @@ export default function LossBoard() {
     {
       title: '差异',
       key: 'diff',
-      width: 100,
+      width: 120,
+      render: (_value, record) => {
+        if (record.reviewState === 'pending') return <Tag color="orange">重扫待复核</Tag>;
+        if (excludedKeys.has(`${record.lineNo}:${record.charNo}`)) return <Tag color="red">缺页不计差异</Tag>;
+        if (!baselineId) return <Typography.Text type="secondary">未选基准</Typography.Text>;
+        return diffKeys.has(`${record.lineNo}:${record.charNo}`) ? <Tag color="gold">存在差异</Tag> : <Tag>与基准一致</Tag>;
+      },
+    },
+    {
+      title: '复核',
+      key: 'review',
+      width: 110,
       render: (_value, record) =>
-        baselineId
-          ? diffKeys.has(`${record.lineNo}:${record.charNo}`)
-            ? <Tag color="gold">存在差异</Tag>
-            : <Tag>与基准一致</Tag>
-          : <Typography.Text type="secondary">未选基准</Typography.Text>,
+        record.reviewState === 'pending' ? (
+          <Popconfirm
+            title="对照新影像件确认该字位"
+            description="确认后恢复参与差异比对；新件若确无此损泐请直接删除该标注。"
+            okText="已复核"
+            cancelText="取消"
+            onConfirm={() =>
+              void dispatch(resolveLossRecheck({ id: record.id, reviewState: 'reconfirmed', reviewNote: record.reviewNote }))
+                .unwrap()
+                .then(() => message.success('已复核，字位恢复参与比对'))
+            }
+          >
+            <Button size="small" type="link">标记已复核</Button>
+          </Popconfirm>
+        ) : record.reviewState === 'reconfirmed' ? (
+          <Tag color="green">已复核</Tag>
+        ) : (
+          <Typography.Text type="secondary">现行</Typography.Text>
+        ),
     },
     {
       title: '操作',
@@ -285,6 +326,7 @@ export default function LossBoard() {
         <StatBadge label="漫漶" value={stat.blur} suffix="条" />
         <StatBadge label="石花" value={stat.stoneFlower} suffix="条" tone="info" />
         <StatBadge label="重度" value={stat.heavy} suffix="条" tone="danger" />
+        <StatBadge label="重扫待复核" value={stat.pending} suffix="处" tone="warning" />
       </div>
 
       <FilterBar
@@ -331,7 +373,11 @@ export default function LossBoard() {
           type={diff.diffCount > 0 ? 'warning' : 'success'}
           showIcon
           message={`与基准拓本差异 ${diff.diffCount} 字（仅当前 ${diff.result.onlyACount} / 仅基准 ${diff.result.onlyBCount} / 程度不同 ${diff.result.severityDiffCount}）`}
-          description="网格中虚线框标记的字位即为差异字位；可在版本比对页生成正式比对记录。"
+          description={
+            diff.result.excludedCount > 0
+              ? `另有 ${diff.result.excludedCount} 处字位因扫描缺页或重扫待复核已剔除、不计差异；网格中朱红描边即为这些位置。`
+              : '网格中虚线框标记的字位即为差异字位；可在版本比对页生成正式比对记录。'
+          }
         />
       ) : null}
 
@@ -370,14 +416,16 @@ export default function LossBoard() {
                   {Array.from({ length: gridLines.cols }, (_v, index) => index + 1).map((charNo) => {
                     const loss = cellLoss(lineNo, charNo);
                     const isDiff = diffKeys.has(`${lineNo}:${charNo}`);
+                    const isExcluded = excludedKeys.has(`${lineNo}:${charNo}`);
+                    const isPendingCell = loss?.reviewState === 'pending';
                     return (
                       <div
                         key={charNo}
-                        className={`gb-loss-cell${loss ? ' is-marked' : ' is-empty'}${isDiff ? ' is-diff' : ''}`}
+                        className={`gb-loss-cell${loss ? ' is-marked' : ' is-empty'}${isDiff ? ' is-diff' : ''}${isExcluded || isPendingCell ? ' is-excluded' : ''}`}
                         style={loss ? { background: LOSS_TYPE_COLOR[loss.type] } : undefined}
                         title={
                           loss
-                            ? `${encodeCoord(lineNo, charNo)}　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}${loss.note ? `　${loss.note}` : ''}`
+                            ? `${encodeCoord(lineNo, charNo)}　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}${isPendingCell ? '　重扫待复核' : ''}${loss.note ? `　${loss.note}` : ''}`
                             : `${encodeCoord(lineNo, charNo)}　未标注`
                         }
                         onClick={() => (loss ? openEdit(loss) : openCreate(lineNo, charNo))}
@@ -444,6 +492,9 @@ export default function LossBoard() {
             </Form.Item>
             <Form.Item name="charNo" label="字位" rules={[{ required: true }]} style={{ flex: 1 }}>
               <InputNumber min={1} max={80} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="pageSeq" label="所在扫描页" tooltip="重扫按页换件、缺页按页剔除差异，均依据此页序" rules={[{ required: true }]} style={{ flex: 1 }}>
+              <InputNumber min={1} max={200} style={{ width: '100%' }} />
             </Form.Item>
           </Space>
           <Space size={12} style={{ display: 'flex' }}>

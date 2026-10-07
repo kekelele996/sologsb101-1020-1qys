@@ -267,6 +267,7 @@ export default function CompareView() {
         <StatBadge label="仅 B 拓本" value={diff.result.onlyBCount} suffix="字" tone="warning" />
         <StatBadge label="程度不同" value={diff.result.severityDiffCount} suffix="字" tone="info" />
         <StatBadge label="一致字位" value={diff.result.sameCount} suffix="字" tone="success" />
+        <StatBadge label="缺页 / 待复核剔除" value={diff.result.excludedCount} suffix="字" tone="warning" />
         <StatBadge label="推断结论" value={COMPARE_CONCLUSION_LABEL[diff.suggestedConclusion]} tone="success" />
       </div>
 
@@ -335,6 +336,24 @@ export default function CompareView() {
       <Row gutter={16} style={{ marginTop: 16 }}>
         <Col xs={24} xl={15}>
           <Card size="small" title="差异字位并排对照">
+            {diff.excludedRows.length > 0 ? (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginBottom: 10 }}
+                message={`${diff.excludedRows.length} 处字位因扫描缺页或重扫待复核已剔除，不计入差异字数`}
+                description={
+                  <Space size={4} wrap>
+                    {diff.excludedRows.map((row) => (
+                      <Tag key={row.key} color={row.excludedReason ? 'red' : 'orange'}>
+                        {encodeCoord(row.lineNo, row.charNo)}
+                        {row.excludedReason === 'missingA' ? '（A 缺页）' : row.excludedReason === 'missingB' ? '（B 缺页）' : '（待复核）'}
+                      </Tag>
+                    ))}
+                  </Space>
+                }
+              />
+            ) : null}
             {filteredDiffRows.length === 0 ? (
               <EmptyPanel
                 title="两个拓本无明显差异"

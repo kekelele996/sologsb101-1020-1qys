@@ -73,6 +73,13 @@ import {
   type SealType,
 } from '@/types/seal';
 import { selectLosses } from '@/stores/lossSlice';
+import { selectScanImages } from '@/stores/scanSlice';
+import {
+  DIGITIZATION_STATE_COLOR,
+  DIGITIZATION_STATE_LABEL,
+  type DigitizationState,
+} from '@/types/scan';
+import { digitizationStateOf, totalPageSeqs } from '@/utils/scan';
 import LossTag from '@/components/common/LossTag';
 
 const FILTER_KEYS = ['method', 'state'] as const;
@@ -88,6 +95,7 @@ export default function RubbingList() {
   const filtered = useAppSelector(selectFilteredRubbings);
   const seals = useAppSelector(selectSeals);
   const losses = useAppSelector(selectLosses);
+  const scanImages = useAppSelector(selectScanImages);
   const steleFilterId = useAppSelector((state) => state.rubbing.filters.steleId);
 
   const url = useFilterQuery(FILTER_KEYS);
@@ -216,6 +224,21 @@ export default function RubbingList() {
     { title: '墨色', dataIndex: 'inkTone', width: 90, render: (value: InkTone) => INK_TONE_LABEL[value] },
     { title: '尺寸', dataIndex: 'sizeCm', width: 110, render: (value: string) => value || '未记' },
     { title: '收藏号', dataIndex: 'collectionNo', width: 120, render: (value: string) => value || '未编' },
+    {
+      title: '数字化',
+      key: 'digitization',
+      width: 130,
+      render: (_value, record) => {
+        const state: DigitizationState = digitizationStateOf(scanImages, record.id);
+        const pages = totalPageSeqs(scanImages, record.id);
+        return (
+          <Space size={4} wrap>
+            <Tag color={DIGITIZATION_STATE_COLOR[state]}>{DIGITIZATION_STATE_LABEL[state]}</Tag>
+            {pages > 0 ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>{pages} 页</Typography.Text> : null}
+          </Space>
+        );
+      },
+    },
     { title: '年代判断', dataIndex: 'dateGuess', width: 120, render: (value: string) => value || '待考' },
     {
       title: '损泐 / 钤印',

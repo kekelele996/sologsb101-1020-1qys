@@ -1,7 +1,11 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录）
- * - 五张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑：
+ *   v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录
+ *   v2 → v3：接入影像组扫描批次（scanBatches / scanImages），
+ *           Loss 增加页序 pageSeq 与重扫复核字段 reviewState/pendingFromBatchNo/reviewNote，
+ *           旧拓本按收藏号补一条「待扫占位」，补不上（无收藏号）也留单条占位并单列认领
+ * - 七张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
@@ -11,13 +15,15 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
+import type { ScanBatch, ScanImage } from '@/types/scan';
 import { sortLosses } from './collate';
+import { normalizeCollectionNo } from './scan';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbrubbing';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +91,8 @@ class RubbingDatabase extends Dexie {
   losses!: Table<Loss, string>;
   seals!: Table<Seal, string>;
   compares!: Table<Compare, string>;
+  scanBatches!: Table<ScanBatch, string>;
+  scanImages!: Table<ScanImage, string>;
 
   constructor() {
     super(DB_NAME);
@@ -127,6 +135,65 @@ class RubbingDatabase extends Dexie {
           });
         });
         await table.bulkPut(sortLosses(rebuilt));
+      });
+
+    // v3：接入影像组扫描批次；Loss 增加页序与重扫复核字段；
+    // 旧数据没写影像号，按收藏号给每份拓本补一条「待扫占位」，无收藏号也补单条（collectionNo 空、单列认领）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        losses: 'id, rubbingId, lineNo, charNo, pageSeq, reviewState, [rubbingId+lineNo+charNo], type, severity, updatedAt',
+        scanBatches: 'id, batchNo, scannedAt, updatedAt',
+        scanImages: 'id, batchId, batchNo, rubbingId, collectionNo, state, pageSeq, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now();
+        const lossTable = tx.table<Loss>('losses');
+        const historicalLosses = await lossTable.toArray();
+        await lossTable.bulkPut(
+          sortLosses(
+            historicalLosses.map((loss) => ({
+              ...loss,
+              pageSeq: 1,
+              reviewState: 'active',
+              pendingFromBatchNo: '',
+              reviewNote: '',
+              updatedAt: now,
+            })),
+          ),
+        );
+
+        const legacyBatch: ScanBatch = {
+          id: 'scanbatch_legacy_placeholders',
+          batchNo: 'LEGACY-待扫',
+          scannedAt: '',
+          source: '旧数据升级补占位',
+          note: '旧数据未写影像号，按收藏号补待扫占位，等影像组批次认领；无收藏号的拓本单列。',
+          createdAt: now,
+          updatedAt: now,
+        };
+        await tx.table<ScanBatch>('scanBatches').put(legacyBatch);
+
+        const legacyRubbings = await tx.table<Rubbing>('rubbings').toArray();
+        const placeholders: ScanImage[] = legacyRubbings.map((rubbing, index) => ({
+          id: `scanimg_legacy_${rubbing.id}`,
+          batchId: legacyBatch.id,
+          batchNo: legacyBatch.batchNo,
+          pageSeq: 1,
+          imageNo: '',
+          fileName: '',
+          scanRound: 0,
+          rescanBatchNo: '',
+          collectionNo: normalizeCollectionNo(rubbing.collectionNo),
+          rubbingId: rubbing.id,
+          state: 'pendingScan',
+          replacesImageId: null,
+          note: normalizeCollectionNo(rubbing.collectionNo)
+            ? '升级按收藏号补的待扫占位'
+            : '该拓本旧数据无收藏号，补不上、单列待认领',
+          createdAt: now + index,
+          updatedAt: now + index,
+        }));
+        if (placeholders.length > 0) await tx.table<ScanImage>('scanImages').bulkPut(placeholders);
       });
   }
 }
@@ -197,19 +264,22 @@ export async function seedDatabase(): Promise<void> {
     { id: 'rub_0201', steleId: 'stele_02', versionNo: 1, method: 'pat', paperType: '皮纸', inkTone: 'thick', sizeCm: '250×196', collectionNo: 'TB-0201', dateGuess: '清中期拓', state: 'cataloged', createdAt: now - day * 40, updatedAt: now - day * 5 },
     { id: 'rub_0202', steleId: 'stele_02', versionNo: 2, method: 'rub', paperType: '棉连纸', inkTone: 'light', sizeCm: '248×194', collectionNo: 'TB-0202', dateGuess: '清晚期拓', state: 'toCatalog', createdAt: now - day * 34, updatedAt: now - day * 4 },
     { id: 'rub_0301', steleId: 'stele_03', versionNo: 1, method: 'rub', paperType: '净皮宣', inkTone: 'thick', sizeCm: '260×90', collectionNo: 'TB-0301', dateGuess: '民国拓', state: 'toCatalog', createdAt: now - day * 20, updatedAt: now - day * 2 },
+    // 旧拓本未编收藏号：升级时待扫占位补不上、单列认领的样例
+    { id: 'rub_0302', steleId: 'stele_03', versionNo: 2, method: 'pat', paperType: '皮纸', inkTone: 'light', sizeCm: '258×88', collectionNo: '', dateGuess: '清末拓', state: 'toCatalog', createdAt: now - day * 14, updatedAt: now - day * 2 },
   ];
 
+  // 页序约定：第 1-6 行在扫描第 1 页，第 7-12 行在第 2 页，第 13 行起在第 3 页
   const losses: Loss[] = [
-    { id: 'loss_010101', rubbingId: 'rub_0101', lineNo: 3, charNo: 7, type: 'blur', severity: 'light', note: '「壽」字右下漫漶', createdAt: now - day * 30, updatedAt: now - day * 30 },
-    { id: 'loss_010102', rubbingId: 'rub_0101', lineNo: 5, charNo: 2, type: 'stoneFlower', severity: 'medium', note: '石花漫及「年」字', createdAt: now - day * 30, updatedAt: now - day * 29 },
-    { id: 'loss_010103', rubbingId: 'rub_0101', lineNo: 9, charNo: 11, type: 'missing', severity: 'heavy', note: '「禮」字缺末笔', createdAt: now - day * 28, updatedAt: now - day * 28 },
-    { id: 'loss_010201', rubbingId: 'rub_0102', lineNo: 3, charNo: 7, type: 'blur', severity: 'medium', note: '晚拓，「壽」字已损', createdAt: now - day * 24, updatedAt: now - day * 24 },
-    { id: 'loss_010202', rubbingId: 'rub_0102', lineNo: 9, charNo: 11, type: 'missing', severity: 'heavy', note: '「禮」字全缺', createdAt: now - day * 24, updatedAt: now - day * 22 },
-    { id: 'loss_010203', rubbingId: 'rub_0102', lineNo: 12, charNo: 4, type: 'crack', severity: 'medium', note: '碑面斜裂一道', createdAt: now - day * 22, updatedAt: now - day * 22 },
-    { id: 'loss_020101', rubbingId: 'rub_0201', lineNo: 2, charNo: 5, type: 'crack', severity: 'light', note: '崖面细裂', createdAt: now - day * 18, updatedAt: now - day * 18 },
-    { id: 'loss_020201', rubbingId: 'rub_0202', lineNo: 2, charNo: 5, type: 'crack', severity: 'light', note: '崖面细裂（同前）', createdAt: now - day * 20, updatedAt: now - day * 20 },
-    { id: 'loss_020202', rubbingId: 'rub_0202', lineNo: 6, charNo: 3, type: 'blur', severity: 'medium', note: '晚拓，「頌」字已漫漶', createdAt: now - day * 18, updatedAt: now - day * 18 },
-    { id: 'loss_030101', rubbingId: 'rub_0301', lineNo: 4, charNo: 3, type: 'blur', severity: 'heavy', note: '民国拓，字口已平', createdAt: now - day * 10, updatedAt: now - day * 10 },
+    { id: 'loss_010101', rubbingId: 'rub_0101', lineNo: 3, charNo: 7, pageSeq: 1, type: 'blur', severity: 'light', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '「壽」字右下漫漶', createdAt: now - day * 30, updatedAt: now - day * 30 },
+    { id: 'loss_010102', rubbingId: 'rub_0101', lineNo: 5, charNo: 2, pageSeq: 1, type: 'stoneFlower', severity: 'medium', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '石花漫及「年」字', createdAt: now - day * 30, updatedAt: now - day * 29 },
+    { id: 'loss_010103', rubbingId: 'rub_0101', lineNo: 9, charNo: 11, pageSeq: 2, type: 'missing', severity: 'heavy', reviewState: 'pending', pendingFromBatchNo: 'SB20260320', reviewNote: '', note: '「禮」字缺末笔（按首扫件标注，第 2 页已重扫，待对照新件复核）', createdAt: now - day * 28, updatedAt: now - day * 2 },
+    { id: 'loss_010201', rubbingId: 'rub_0102', lineNo: 3, charNo: 7, pageSeq: 1, type: 'blur', severity: 'medium', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '晚拓，「壽」字已损', createdAt: now - day * 24, updatedAt: now - day * 24 },
+    { id: 'loss_010202', rubbingId: 'rub_0102', lineNo: 9, charNo: 11, pageSeq: 2, type: 'missing', severity: 'heavy', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '「禮」字全缺', createdAt: now - day * 24, updatedAt: now - day * 22 },
+    { id: 'loss_010203', rubbingId: 'rub_0102', lineNo: 12, charNo: 4, pageSeq: 2, type: 'crack', severity: 'medium', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '碑面斜裂一道', createdAt: now - day * 22, updatedAt: now - day * 22 },
+    { id: 'loss_020101', rubbingId: 'rub_0201', lineNo: 2, charNo: 5, pageSeq: 1, type: 'crack', severity: 'light', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '崖面细裂', createdAt: now - day * 18, updatedAt: now - day * 18 },
+    { id: 'loss_020201', rubbingId: 'rub_0202', lineNo: 2, charNo: 5, pageSeq: 1, type: 'crack', severity: 'light', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '崖面细裂（同前）', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'loss_020202', rubbingId: 'rub_0202', lineNo: 6, charNo: 3, pageSeq: 1, type: 'blur', severity: 'medium', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '晚拓，「頌」字已漫漶（第 1 页影像缺页，比对时该字位不计差异）', createdAt: now - day * 18, updatedAt: now - day * 18 },
+    { id: 'loss_030101', rubbingId: 'rub_0301', lineNo: 4, charNo: 3, pageSeq: 1, type: 'blur', severity: 'heavy', reviewState: 'active', pendingFromBatchNo: '', reviewNote: '', note: '民国拓，字口已平', createdAt: now - day * 10, updatedAt: now - day * 10 },
   ];
 
   const seals: Seal[] = [
@@ -224,13 +294,47 @@ export async function seedDatabase(): Promise<void> {
     { id: 'cmp_0201', steleId: 'stele_02', rubbingIdA: 'rub_0201', rubbingIdB: 'rub_0202', diffCount: 1, conclusion: 'late', operator: '傅砚', date: '2026-03-08', createdAt: now - day * 3, updatedAt: now - day * 3 },
   ];
 
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.steles.bulkPut(steles);
-    await db.rubbings.bulkPut(rubbings);
-    await db.losses.bulkPut(losses);
-    await db.seals.bulkPut(seals);
-    await db.compares.bulkPut(compares);
-  });
+  // 扫描批次：首扫批 → 重扫批（TB-0101 第 2 页换件，旧字位挂起待复核）；TB-0202 报备缺页
+  const scanBatches: ScanBatch[] = [
+    { id: 'scanbatch_01', batchNo: 'SB20260301', scannedAt: '2026-03-01', source: '影像组', note: '第一批扫描：礼器碑两拓本 + 石门颂早本', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'scanbatch_02', batchNo: 'SB20260310', scannedAt: '2026-03-10', source: '影像组', note: '石门颂晚本：第 1 页折角缺页登记，第 2 页先扫', createdAt: now - day * 11, updatedAt: now - day * 11 },
+    { id: 'scanbatch_03', batchNo: 'SB20260320', scannedAt: '2026-03-20', source: '影像组', note: '重扫：TB-0101 第 2 页影像换件', createdAt: now - day * 2, updatedAt: now - day * 2 },
+    { id: 'scanbatch_legacy_placeholders', batchNo: 'LEGACY-待扫', scannedAt: '', source: '旧数据升级补占位', note: '旧数据未写影像号，按收藏号补待扫占位；无收藏号的拓本单列。', createdAt: now - day * 1, updatedAt: now - day * 1 },
+  ];
+
+  const scanImages: ScanImage[] = [
+    // TB-0101：第 1 页首扫件；第 2 页首扫件已被重扫替换（superseded）
+    { id: 'scanimg_0101_p1', batchId: 'scanbatch_01', batchNo: 'SB20260301', pageSeq: 1, imageNo: 'IMG-0101-01', fileName: 'TB-0101_p1.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0101', rubbingId: 'rub_0101', state: 'attached', replacesImageId: null, note: '', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'scanimg_0101_p2_old', batchId: 'scanbatch_01', batchNo: 'SB20260301', pageSeq: 2, imageNo: 'IMG-0101-02', fileName: 'TB-0101_p2.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0101', rubbingId: 'rub_0101', state: 'superseded', replacesImageId: null, note: '首扫件偏色，已被 SB20260320 重扫件替换', createdAt: now - day * 20, updatedAt: now - day * 2 },
+    { id: 'scanimg_0101_p2_new', batchId: 'scanbatch_03', batchNo: 'SB20260320', pageSeq: 2, imageNo: 'IMG-0101-02-R1', fileName: 'TB-0101_p2_rescan.tif', scanRound: 2, rescanBatchNo: 'SB20260320', collectionNo: 'TB-0101', rubbingId: 'rub_0101', state: 'attached', replacesImageId: 'scanimg_0101_p2_old', note: '重扫换件，旧件标注的损泐字位待复核', createdAt: now - day * 2, updatedAt: now - day * 2 },
+    // TB-0102：3 页齐全，数字化完成
+    { id: 'scanimg_0102_p1', batchId: 'scanbatch_01', batchNo: 'SB20260301', pageSeq: 1, imageNo: 'IMG-0102-01', fileName: 'TB-0102_p1.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0102', rubbingId: 'rub_0102', state: 'attached', replacesImageId: null, note: '', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'scanimg_0102_p2', batchId: 'scanbatch_01', batchNo: 'SB20260301', pageSeq: 2, imageNo: 'IMG-0102-02', fileName: 'TB-0102_p2.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0102', rubbingId: 'rub_0102', state: 'attached', replacesImageId: null, note: '', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'scanimg_0102_p3', batchId: 'scanbatch_01', batchNo: 'SB20260301', pageSeq: 3, imageNo: 'IMG-0102-03', fileName: 'TB-0102_p3.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0102', rubbingId: 'rub_0102', state: 'attached', replacesImageId: null, note: '', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    // TB-0201：2 页齐全，数字化完成
+    { id: 'scanimg_0201_p1', batchId: 'scanbatch_01', batchNo: 'SB20260301', pageSeq: 1, imageNo: 'IMG-0201-01', fileName: 'TB-0201_p1.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0201', rubbingId: 'rub_0201', state: 'attached', replacesImageId: null, note: '', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'scanimg_0201_p2', batchId: 'scanbatch_01', batchNo: 'SB20260301', pageSeq: 2, imageNo: 'IMG-0201-02', fileName: 'TB-0201_p2.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0201', rubbingId: 'rub_0201', state: 'attached', replacesImageId: null, note: '', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    // TB-0202：第 1 页缺页登记、第 2 页已扫，页序未齐（比对时第 1 页字位不计差异）
+    { id: 'scanimg_0202_p1_miss', batchId: 'scanbatch_02', batchNo: 'SB20260310', pageSeq: 1, imageNo: '', fileName: '', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0202', rubbingId: 'rub_0202', state: 'missing', replacesImageId: null, note: '折角待重扫', createdAt: now - day * 11, updatedAt: now - day * 11 },
+    { id: 'scanimg_0202_p2', batchId: 'scanbatch_02', batchNo: 'SB20260310', pageSeq: 2, imageNo: 'IMG-0202-02', fileName: 'TB-0202_p2.tif', scanRound: 1, rescanBatchNo: '', collectionNo: 'TB-0202', rubbingId: 'rub_0202', state: 'attached', replacesImageId: null, note: '', createdAt: now - day * 11, updatedAt: now - day * 11 },
+    // TB-0301 与无收藏号旧拓本：升级补的待扫占位（后者补不上、单列认领）
+    { id: 'scanimg_legacy_rub_0301', batchId: 'scanbatch_legacy_placeholders', batchNo: 'LEGACY-待扫', pageSeq: 1, imageNo: '', fileName: '', scanRound: 0, rescanBatchNo: '', collectionNo: 'TB-0301', rubbingId: 'rub_0301', state: 'pendingScan', replacesImageId: null, note: '升级按收藏号补的待扫占位', createdAt: now - day * 1, updatedAt: now - day * 1 },
+    { id: 'scanimg_legacy_rub_0302', batchId: 'scanbatch_legacy_placeholders', batchNo: 'LEGACY-待扫', pageSeq: 1, imageNo: '', fileName: '', scanRound: 0, rescanBatchNo: '', collectionNo: '', rubbingId: 'rub_0302', state: 'pendingScan', replacesImageId: null, note: '该拓本旧数据无收藏号，补不上、单列待认领', createdAt: now - day * 1, updatedAt: now - day * 1 },
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.scanBatches, db.scanImages],
+    async () => {
+      await db.steles.bulkPut(steles);
+      await db.rubbings.bulkPut(rubbings);
+      await db.losses.bulkPut(losses);
+      await db.seals.bulkPut(seals);
+      await db.compares.bulkPut(compares);
+      await db.scanBatches.bulkPut(scanBatches);
+      await db.scanImages.bulkPut(scanImages);
+    },
+  );
 }
 
 /* ------------------------------ 整库导入导出 ------------------------------ */
@@ -244,15 +348,19 @@ export interface RubbingSnapshot {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  scanBatches: ScanBatch[];
+  scanImages: ScanImage[];
 }
 
 export async function exportSnapshot(): Promise<RubbingSnapshot> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, scanBatches, scanImages] = await Promise.all([
     db.steles.toArray(),
     db.rubbings.toArray(),
     db.losses.toArray(),
     db.seals.toArray(),
     db.compares.toArray(),
+    db.scanBatches.toArray(),
+    db.scanImages.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -263,10 +371,12 @@ export async function exportSnapshot(): Promise<RubbingSnapshot> {
     losses,
     seals,
     compares,
+    scanBatches,
+    scanImages,
   };
 }
 
-/** 校验导入文件结构，返回错误文案（空串表示通过） */
+/** 校验导入文件结构，返回错误文案（空串表示通过）；旧版备份缺扫描集合时按空集合兼容 */
 export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<RubbingSnapshot>;
@@ -278,26 +388,41 @@ export function validateSnapshot(input: unknown): string {
   return '';
 }
 
+const ALL_TABLES = [
+  db.steles,
+  db.rubbings,
+  db.losses,
+  db.seals,
+  db.compares,
+  db.scanBatches,
+  db.scanImages,
+] as const;
+
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', ALL_TABLES, async () => {
     await Promise.all([
       db.steles.clear(),
       db.rubbings.clear(),
       db.losses.clear(),
       db.seals.clear(),
       db.compares.clear(),
+      db.scanBatches.clear(),
+      db.scanImages.clear(),
     ]);
   });
 }
 
 export async function importSnapshot(snapshot: RubbingSnapshot): Promise<void> {
   await clearAllTables();
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', ALL_TABLES, async () => {
     await db.steles.bulkPut(snapshot.steles);
     await db.rubbings.bulkPut(snapshot.rubbings);
     await db.losses.bulkPut(snapshot.losses);
     await db.seals.bulkPut(snapshot.seals);
     await db.compares.bulkPut(snapshot.compares);
+    // 兼容 v2 及更早备份：没有扫描数据时导入空集合
+    if (Array.isArray(snapshot.scanBatches)) await db.scanBatches.bulkPut(snapshot.scanBatches);
+    if (Array.isArray(snapshot.scanImages)) await db.scanImages.bulkPut(snapshot.scanImages);
   });
 }
 
@@ -307,40 +432,52 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, scanBatches, scanImages] = await Promise.all([
     db.steles.count(),
     db.rubbings.count(),
     db.losses.count(),
     db.seals.count(),
     db.compares.count(),
+    db.scanBatches.count(),
+    db.scanImages.count(),
   ]);
-  return { steles, rubbings, losses, seals, compares };
+  return { steles, rubbings, losses, seals, compares, scanBatches, scanImages };
 }
 
-/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 */
+/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 / 影像件 */
 export async function removeSteleCascade(steleId: string): Promise<void> {
   const rubbingIds = (await db.rubbings.where('steleId').equals(steleId).toArray()).map((row) => row.id);
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    if (rubbingIds.length > 0) {
-      await db.losses.where('rubbingId').anyOf(rubbingIds).delete();
-      await db.seals.where('rubbingId').anyOf(rubbingIds).delete();
-    }
-    await db.rubbings.where('steleId').equals(steleId).delete();
-    await db.compares.where('steleId').equals(steleId).delete();
-    await db.steles.delete(steleId);
-  });
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.scanImages],
+    async () => {
+      if (rubbingIds.length > 0) {
+        await db.losses.where('rubbingId').anyOf(rubbingIds).delete();
+        await db.seals.where('rubbingId').anyOf(rubbingIds).delete();
+        await db.scanImages.where('rubbingId').anyOf(rubbingIds).delete();
+      }
+      await db.rubbings.where('steleId').equals(steleId).delete();
+      await db.compares.where('steleId').equals(steleId).delete();
+      await db.steles.delete(steleId);
+    },
+  );
 }
 
-/** 级联删除拓本 → 损泐 / 钤印 / 涉及的比对记录 */
+/** 级联删除拓本 → 损泐 / 钤印 / 影像件 / 涉及的比对记录 */
 export async function removeRubbingCascade(rubbingId: string): Promise<void> {
-  await db.transaction('rw', [db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.losses.where('rubbingId').equals(rubbingId).delete();
-    await db.seals.where('rubbingId').equals(rubbingId).delete();
-    const compares = await db.compares.toArray();
-    const affected = compares.filter((row) => row.rubbingIdA === rubbingId || row.rubbingIdB === rubbingId);
-    if (affected.length > 0) await db.compares.bulkDelete(affected.map((row) => row.id));
-    await db.rubbings.delete(rubbingId);
-  });
+  await db.transaction(
+    'rw',
+    [db.rubbings, db.losses, db.seals, db.compares, db.scanImages],
+    async () => {
+      await db.losses.where('rubbingId').equals(rubbingId).delete();
+      await db.seals.where('rubbingId').equals(rubbingId).delete();
+      await db.scanImages.where('rubbingId').equals(rubbingId).delete();
+      const compares = await db.compares.toArray();
+      const affected = compares.filter((row) => row.rubbingIdA === rubbingId || row.rubbingIdB === rubbingId);
+      if (affected.length > 0) await db.compares.bulkDelete(affected.map((row) => row.id));
+      await db.rubbings.delete(rubbingId);
+    },
+  );
 }
 
 /** 重排某碑刻下拓本的版本序号，保证连续 */

@@ -9,6 +9,15 @@ export type LossType = 'missing' | 'crack' | 'blur' | 'stoneFlower';
 /** 严重程度：轻 / 中 / 重 */
 export type LossSeverity = 'light' | 'medium' | 'heavy';
 
+/**
+ * 复核状态（重扫对账）：
+ * - active      现行有效，可参与差异比对
+ * - pending     待复核：该字位所在页被重扫换件，按旧件标的位置需对照新件复核；
+ *               不直接算作差异，只挂出待人工确认
+ * - reconfirmed 已复核：编目员已对照新影像件确认过位置
+ */
+export type LossReviewState = 'active' | 'pending' | 'reconfirmed';
+
 export interface Loss {
   id: string;
   /** 所属拓本 id */
@@ -17,10 +26,18 @@ export interface Loss {
   lineNo: number;
   /** 字位，行内第几字，从 1 开始 */
   charNo: number;
+  /** 所在扫描页序，从 1 开始（重扫按页换件、缺页按页剔除均据此） */
+  pageSeq: number;
   /** 损泐类型 */
   type: LossType;
   /** 严重程度 */
   severity: LossSeverity;
+  /** 复核状态 */
+  reviewState: LossReviewState;
+  /** 触发待复核的重扫批次号 */
+  pendingFromBatchNo: string;
+  /** 复核备注 */
+  reviewNote: string;
   /** 释文备注 */
   note: string;
   createdAt: number;
@@ -68,13 +85,23 @@ export const LOSS_SEVERITY_OPTIONS: ReadonlyArray<{ value: LossSeverity; label: 
   { value: 'heavy', label: '重' },
 ];
 
-export function createEmptyLossDraft(rubbingId: string, lineNo: number, charNo: number): LossDraft {
+export const LOSS_REVIEW_LABEL: Record<LossReviewState, string> = {
+  active: '现行',
+  pending: '待复核',
+  reconfirmed: '已复核',
+};
+
+export function createEmptyLossDraft(rubbingId: string, lineNo: number, charNo: number, pageSeq = 1): LossDraft {
   return {
     rubbingId,
     lineNo,
     charNo,
+    pageSeq,
     type: 'missing',
     severity: 'medium',
+    reviewState: 'active',
+    pendingFromBatchNo: '',
+    reviewNote: '',
     note: '',
   };
 }
