@@ -3,7 +3,7 @@
  * 选定两个拓本即生成损泐差异清单并排展示，可落库为比对记录并回写断代结论。
  * 消费 Compare、Loss、Rubbing；复用 <LossTag>、<StatBadge>、<EmptyPanel>、<FilterBar>。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   App as AntdApp,
@@ -41,6 +41,7 @@ import {
   setCompareB,
   updateCompare,
 } from '@/stores/lossSlice';
+import { selectMissingPages } from '@/stores/scanSlice';
 import { LOSS_TYPE_OPTIONS, type LossType } from '@/types/loss';
 import {
   COMPARE_CONCLUSION_COLOR,
@@ -65,9 +66,16 @@ export default function CompareView() {
   const rubbings = useAppSelector(selectRubbings);
   const compares = useAppSelector(selectCompares);
   const losses = useAppSelector(selectLosses);
+  const missingPages = useAppSelector(selectMissingPages);
   const compareAId = useAppSelector((state) => state.loss.compareAId);
   const compareBId = useAppSelector((state) => state.loss.compareBId);
   const currentSteleId = useAppSelector((state) => state.stele.currentSteleId);
+
+  const missingPageNosOf = useCallback(
+    (rubbingId: string): number[] =>
+      missingPages.filter((page) => page.rubbingId === rubbingId && page.state === 'open').map((page) => page.pageNo),
+    [missingPages],
+  );
 
   const url = useFilterQuery(FILTER_KEYS);
   const [steleId, setSteleId] = useState<string>('');
@@ -137,6 +145,18 @@ export default function CompareView() {
       return true;
     });
   }, [diff.diffRows, url.keyword, url.values]);
+
+  /** 因缺页被排除的差异字位（页序缺的那几处，不能算进差异字数） */
+  const filteredExcludedRows = useMemo(() => {
+    const keyword = url.keyword.trim();
+    return diff.excludedRows.filter((row) => {
+      if (keyword.length > 0) {
+        const haystack = `${encodeCoord(row.lineNo, row.charNo)}${row.lossA?.note ?? ''}${row.lossB?.note ?? ''}`;
+        if (!haystack.includes(keyword)) return false;
+      }
+      return true;
+    });
+  }, [diff.excludedRows, url.keyword]);
 
   const openCreate = (): void => {
     if (!steleId || !compareAId || !compareBId) {
@@ -266,6 +286,12 @@ export default function CompareView() {
         <StatBadge label="仅 A 拓本" value={diff.result.onlyACount} suffix="字" tone="primary" />
         <StatBadge label="仅 B 拓本" value={diff.result.onlyBCount} suffix="字" tone="warning" />
         <StatBadge label="程度不同" value={diff.result.severityDiffCount} suffix="字" tone="info" />
+        <StatBadge
+          label="缺页未计入"
+          value={diff.result.excludedCount}
+          suffix="处"
+          tone="warning"
+        />
         <StatBadge label="一致字位" value={diff.result.sameCount} suffix="字" tone="success" />
         <StatBadge label="推断结论" value={COMPARE_CONCLUSION_LABEL[diff.suggestedConclusion]} tone="success" />
       </div>
@@ -305,12 +331,23 @@ export default function CompareView() {
           <Typography.Text type="secondary">
             A 损泐 {diff.result.totalA} 条 · B 损泐 {diff.result.totalB} 条
           </Typography.Text>
+          {(lossesOfA.some((loss) => loss.reviewState === 'pending') ||
+            lossesOfB.some((loss) => loss.reviewState === 'pending')) ? (
+            <Tag color="orange">
+              含待复核字位
+              {lossesOfA.filter((loss) => loss.reviewState === 'pending').length +
+                lossesOfB.filter((loss) => loss.reviewState === 'pending').length}
+              条（重扫后按旧件标注，结论仅供参考）
+            </Tag>
+          ) : null}
           <Button
             size="small"
             onClick={async () => {
               if (!stele || !rubbingA || !rubbingB) return;
+              const missingA = missingPageNosOf(compareAId ?? '');
+              const missingB = missingPageNosOf(compareBId ?? '');
               const ok = await copyText(
-                buildDiffText(stele, rubbingA, rubbingB, lossesOfA, lossesOfB),
+                buildDiffText(stele, rubbingA, rubbingB, lossesOfA, lossesOfB, missingA, missingB),
               );
               if (ok) message.success('差异清单已复制');
               else message.warning('浏览器未授权剪贴板');
@@ -375,6 +412,49 @@ export default function CompareView() {
                 ))}
               </Space>
             )}
+            {filteredExcludedRows.length > 0 ? (
+              <div style={{ marginTop: 12 }}>
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 8 }}
+                  message={`以下 ${filteredExcludedRows.length} 处因页序缺失未计入差异字数`}
+                  description="待补扫页补齐后再比对，避免缺页把比对结果冲虚。"
+                />
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {filteredExcludedRows.map((row) => (
+                    <div key={`ex-${row.key}`} className="gb-diff-pair" style={{ opacity: 0.62 }}>
+                      <div className="gb-diff-card is-a">
+                        <Space size={6} wrap>
+                          <Tag>{encodeCoord(row.lineNo, row.charNo)}</Tag>
+                          <Typography.Text type="secondary">{row.excludedReason}</Typography.Text>
+                        </Space>
+                        <div style={{ marginTop: 6 }}>
+                          {row.lossA ? (
+                            <LossTag type={row.lossA.type} severity={row.lossA.severity} note={row.lossA.note} size="small" />
+                          ) : (
+                            <Typography.Text type="secondary">该页缺扫</Typography.Text>
+                          )}
+                        </div>
+                      </div>
+                      <div className="gb-diff-card is-b">
+                        <Space size={6} wrap>
+                          <Tag>{encodeCoord(row.lineNo, row.charNo)}</Tag>
+                          <Typography.Text type="secondary">不计入差异</Typography.Text>
+                        </Space>
+                        <div style={{ marginTop: 6 }}>
+                          {row.lossB ? (
+                            <LossTag type={row.lossB.type} severity={row.lossB.severity} note={row.lossB.note} size="small" />
+                          ) : (
+                            <Typography.Text type="secondary">该页缺扫</Typography.Text>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </Space>
+              </div>
+            ) : null}
           </Card>
         </Col>
 

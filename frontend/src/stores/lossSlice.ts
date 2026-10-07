@@ -13,6 +13,8 @@ export interface LossFilters {
   keyword: string;
   types: LossType[];
   severities: LossSeverity[];
+  /** 复核状态筛选：空 = 全部 */
+  reviewStates: Array<'active' | 'pending'>;
 }
 
 export interface LossState {
@@ -33,20 +35,45 @@ const initialState: LossState = {
   loading: false,
   ready: false,
   error: '',
-  filters: { keyword: '', types: [], severities: [] },
+  filters: { keyword: '', types: [], severities: [], reviewStates: [] },
   compareAId: null,
   compareBId: null,
 };
 
+/** 查某拓本某页当前有效影像号（重扫后新标注按新件记） */
+async function activeImageNo(rubbingId: string, pageNo: number): Promise<string> {
+  const image = await db.scanImages
+    .where('rubbingId').equals(rubbingId)
+    .and((row) => row.status === 'active' && row.pageNo === pageNo)
+    .first();
+  return image?.imageNo ?? '';
+}
+
 export const loadLosses = createAsyncThunk('loss/load', async () => {
-  const [losses, compares] = await Promise.all([db.losses.toArray(), db.compares.toArray()]);
+  const [rawLosses, compares] = await Promise.all([db.losses.toArray(), db.compares.toArray()]);
+  // 兼容 v2 时代导入的备份：补齐 pageNo / 复核字段默认值
+  const losses = rawLosses.map((loss) => ({
+    ...loss,
+    pageNo: typeof loss.pageNo === 'number' && loss.pageNo > 0 ? loss.pageNo : 1,
+    reviewState: loss.reviewState === 'pending' ? ('pending' as const) : ('active' as const),
+    reviewReason: loss.reviewReason ?? '',
+    markedImageNo: loss.markedImageNo ?? '',
+  }));
   compares.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
   return { losses: sortLosses(losses), compares };
 });
 
 export const createLoss = createAsyncThunk('loss/create', async (draft: LossDraft, { dispatch }) => {
   const now = Date.now();
-  const row: Loss = { ...draft, id: createId('loss'), createdAt: now, updatedAt: now };
+  const row: Loss = {
+    ...draft,
+    id: createId('loss'),
+    reviewState: 'active',
+    reviewReason: '',
+    markedImageNo: await activeImageNo(draft.rubbingId, draft.pageNo),
+    createdAt: now,
+    updatedAt: now,
+  };
   await db.losses.put(row);
   await dispatch(loadLosses());
   return row;
@@ -55,7 +82,12 @@ export const createLoss = createAsyncThunk('loss/create', async (draft: LossDraf
 export const updateLoss = createAsyncThunk(
   'loss/update',
   async (payload: { id: string; patch: Partial<Loss> }, { dispatch }) => {
-    await db.losses.update(payload.id, { ...payload.patch, updatedAt: Date.now() } as never);
+    // 改到别的页时，标注依据换为该页当前有效影像件；页未变则保留原影像号
+    const extra: Partial<Loss> = {};
+    if (typeof payload.patch.pageNo === 'number' && typeof payload.patch.rubbingId === 'string') {
+      extra.markedImageNo = await activeImageNo(payload.patch.rubbingId, payload.patch.pageNo);
+    }
+    await db.losses.update(payload.id, { ...payload.patch, ...extra, updatedAt: Date.now() } as never);
     await dispatch(loadLosses());
   },
 );
@@ -112,8 +144,11 @@ const lossSlice = createSlice({
     setLossSeverities(state, action: PayloadAction<LossSeverity[]>) {
       state.filters.severities = action.payload;
     },
+    setLossReviewStates(state, action: PayloadAction<Array<'active' | 'pending'>>) {
+      state.filters.reviewStates = action.payload;
+    },
     resetLossFilters(state) {
-      state.filters = { keyword: '', types: [], severities: [] };
+      state.filters = { keyword: '', types: [], severities: [], reviewStates: [] };
     },
     setCompareA(state, action: PayloadAction<string | null>) {
       state.compareAId = action.payload;
@@ -146,6 +181,7 @@ export const {
   setLossKeyword,
   setLossTypes,
   setLossSeverities,
+  setLossReviewStates,
   resetLossFilters,
   setCompareA,
   setCompareB,
@@ -175,6 +211,20 @@ export function selectLossCountByRubbing(state: RootState): Record<string, numbe
   const result: Record<string, number> = {};
   state.loss.items.forEach((loss) => {
     result[loss.rubbingId] = (result[loss.rubbingId] ?? 0) + 1;
+  });
+  return result;
+}
+
+/** 全库待复核字位（重扫换件后挂起） */
+export function selectPendingLosses(state: RootState): Loss[] {
+  return state.loss.items.filter((loss) => loss.reviewState === 'pending');
+}
+
+/** 某拓本待复核字数 */
+export function selectPendingCountByRubbing(state: RootState): Record<string, number> {
+  const result: Record<string, number> = {};
+  state.loss.items.forEach((loss) => {
+    if (loss.reviewState === 'pending') result[loss.rubbingId] = (result[loss.rubbingId] ?? 0) + 1;
   });
   return result;
 }

@@ -3,7 +3,8 @@
  * 按行号字位网格标注并批量改程度；可选定基准拓本即时查看同碑差异。
  * 消费 Loss、Rubbing；复用 <LossTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Alert,
   App as AntdApp,
@@ -40,10 +41,12 @@ import {
   resetLossFilters,
   selectLosses,
   setLossKeyword,
+  setLossReviewStates,
   setLossSeverities,
   setLossTypes,
   updateLoss,
 } from '@/stores/lossSlice';
+import { resolveLossReviews, selectMissingPages, selectScanImages } from '@/stores/scanSlice';
 import {
   LOSS_SEVERITY_COLOR,
   LOSS_SEVERITY_LABEL,
@@ -56,7 +59,10 @@ import {
   type LossDraft,
   type LossSeverity,
   type LossType,
+  LOSS_REVIEW_STATE_LABEL,
 } from '@/types/loss';
+import { DigitizeTag } from '@/components/common/DigitizeTag';
+import { deriveDigitization, formatPageNos } from '@/utils/scan';
 import { encodeCoord, groupByLine, maxCharNo, sortLosses } from '@/utils/collate';
 
 const FILTER_KEYS = ['type', 'severity'] as const;
@@ -69,8 +75,11 @@ export default function LossBoard() {
   const steles = useAppSelector(selectSteles);
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
+  const scanImages = useAppSelector(selectScanImages);
+  const missingPages = useAppSelector(selectMissingPages);
 
   const url = useFilterQuery(FILTER_KEYS);
+  const [searchParams] = useSearchParams();
   const [rubbingId, setRubbingId] = useState<string>('');
   const [baselineId, setBaselineId] = useState<string>('');
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -82,13 +91,33 @@ export default function LossBoard() {
     dispatch(setLossKeyword(url.keyword));
     dispatch(setLossTypes((url.values.type ?? []) as LossType[]));
     dispatch(setLossSeverities((url.values.severity ?? []) as LossSeverity[]));
+    dispatch(setLossReviewStates((url.values.review ?? []).filter((v) => v === 'active' || v === 'pending')));
   }, [dispatch, url.keyword, url.values]);
 
+  // 从扫描页跳转时携带 ?rubbing= 仅在本页首次载入时生效；之后以页内选择为准
+  const initialRubbingRef = useRef(searchParams.get('rubbing'));
   useEffect(() => {
-    if (rubbingId.length === 0 && rubbings.length > 0) setRubbingId(rubbings[0]?.id ?? '');
+    if (rubbingId.length === 0 && rubbings.length > 0) {
+      const fromQuery = initialRubbingRef.current;
+      setRubbingId(
+        fromQuery && rubbings.some((rubbing) => rubbing.id === fromQuery) ? fromQuery : (rubbings[0]?.id ?? ''),
+      );
+    }
   }, [rubbingId, rubbings]);
 
   const currentRubbing = rubbings.find((rubbing) => rubbing.id === rubbingId) ?? null;
+  const currentScans = useMemo(
+    () => (currentRubbing ? scanImages.filter((image) => image.rubbingId === currentRubbing.id) : []),
+    [currentRubbing, scanImages],
+  );
+  const currentMissing = useMemo(
+    () => (currentRubbing ? missingPages.filter((page) => page.rubbingId === currentRubbing.id) : []),
+    [currentRubbing, missingPages],
+  );
+  const digitization = useMemo(
+    () => deriveDigitization(currentScans, currentMissing),
+    [currentScans, currentMissing],
+  );
   const diff = useLossDiff(rubbingId, baselineId);
   const diffKeys = useMemo(
     () => new Set(diff.diffRows.map((row) => `${row.lineNo}:${row.charNo}`)),
@@ -104,6 +133,7 @@ export default function LossBoard() {
     const keyword = url.keyword.trim();
     const types = url.values.type ?? [];
     const severities = url.values.severity ?? [];
+    const reviews = (url.values.review ?? []).filter((v) => v === 'active' || v === 'pending');
     return sortLosses(
       losses.filter((loss) => {
         if (loss.rubbingId !== rubbingId) return false;
@@ -113,6 +143,7 @@ export default function LossBoard() {
         }
         if (types.length > 0 && !types.includes(loss.type)) return false;
         if (severities.length > 0 && !severities.includes(loss.severity)) return false;
+        if (reviews.length > 0 && !reviews.includes(loss.reviewState)) return false;
         return true;
       }),
     );
@@ -129,6 +160,7 @@ export default function LossBoard() {
       blur: count('blur'),
       stoneFlower: count('stoneFlower'),
       heavy: list.filter((loss) => loss.severity === 'heavy').length,
+      pending: list.filter((loss) => loss.reviewState === 'pending').length,
     };
   }, [losses, rubbingId]);
 
@@ -143,6 +175,14 @@ export default function LossBoard() {
   const selects: FilterSelectConfig[] = [
     { key: 'type', label: '损泐类型', options: LOSS_TYPE_OPTIONS.map((item) => ({ value: item.value, label: item.label })) },
     { key: 'severity', label: '程度', options: LOSS_SEVERITY_OPTIONS.map((item) => ({ value: item.value, label: item.label })) },
+    {
+      key: 'review',
+      label: '复核',
+      options: [
+        { value: 'active', label: '有效' },
+        { value: 'pending', label: '待复核' },
+      ],
+    },
   ];
 
   const openCreate = (lineNo = 1, charNo = 1): void => {
@@ -151,7 +191,7 @@ export default function LossBoard() {
       return;
     }
     setEditing(null);
-    form.setFieldsValue(createEmptyLossDraft(rubbingId, lineNo, charNo));
+    form.setFieldsValue(createEmptyLossDraft(rubbingId, lineNo, charNo, 1));
     setOpen(true);
   };
 
@@ -161,6 +201,7 @@ export default function LossBoard() {
       rubbingId: loss.rubbingId,
       lineNo: loss.lineNo,
       charNo: loss.charNo,
+      pageNo: loss.pageNo,
       type: loss.type,
       severity: loss.severity,
       note: loss.note,
@@ -189,7 +230,14 @@ export default function LossBoard() {
       key: 'coord',
       width: 120,
       sorter: (a, b) => (a.lineNo === b.lineNo ? a.charNo - b.charNo : a.lineNo - b.lineNo),
-      render: (_value, record) => <Tag color="#2f3a34">{encodeCoord(record.lineNo, record.charNo)}</Tag>,
+      render: (_value, record) => (
+        <Space size={4} direction="vertical">
+          <Tag color="#2f3a34">{encodeCoord(record.lineNo, record.charNo)}</Tag>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            第 {record.pageNo} 页
+          </Typography.Text>
+        </Space>
+      ),
     },
     {
       title: '损泐类型',
@@ -219,6 +267,31 @@ export default function LossBoard() {
             ? <Tag color="gold">存在差异</Tag>
             : <Tag>与基准一致</Tag>
           : <Typography.Text type="secondary">未选基准</Typography.Text>,
+    },
+    {
+      title: '复核',
+      key: 'review',
+      width: 150,
+      render: (_value, record) =>
+        record.reviewState === 'pending' ? (
+          <Popconfirm
+            title="按新影像件复核该字位"
+            description={record.reviewReason}
+            okText="复核通过"
+            cancelText="取消"
+            onConfirm={() =>
+              void dispatch(resolveLossReviews([record.id]))
+                .unwrap()
+                .then(() => message.success(`${encodeCoord(record.lineNo, record.charNo)} 已确认有效`))
+            }
+          >
+            <Tag color="orange" style={{ cursor: 'pointer' }}>
+              {LOSS_REVIEW_STATE_LABEL.pending}
+            </Tag>
+          </Popconfirm>
+        ) : (
+          <Tag color="green">{LOSS_REVIEW_STATE_LABEL.active}</Tag>
+        ),
     },
     {
       title: '操作',
@@ -284,6 +357,7 @@ export default function LossBoard() {
         <StatBadge label="裂痕" value={stat.crack} suffix="条" tone="warning" />
         <StatBadge label="漫漶" value={stat.blur} suffix="条" />
         <StatBadge label="石花" value={stat.stoneFlower} suffix="条" tone="info" />
+        <StatBadge label="待复核" value={stat.pending} suffix="条" tone="warning" />
         <StatBadge label="重度" value={stat.heavy} suffix="条" tone="danger" />
       </div>
 
@@ -325,12 +399,35 @@ export default function LossBoard() {
         }
       />
 
+      {currentRubbing ? (
+        <Alert
+          style={{ marginTop: 14 }}
+          type={digitization.state === 'done' ? 'success' : digitization.state === 'scanning' ? 'warning' : 'info'}
+          showIcon
+          message={
+            <Space wrap>
+              <DigitizeTag state={digitization.state} />
+              <span>
+                有效影像 {digitization.activeCount} / {digitization.pageCount || '?'} 页
+              </span>
+              {digitization.missingPageNos.length > 0 ? (
+                <Tag color="red">{formatPageNos(digitization.missingPageNos)} 缺扫，这些页上的损泐不计入版本差异字数</Tag>
+              ) : null}
+              {digitization.rescanCount > 0 ? <Tag color="orange">历经 {digitization.rescanCount} 次重扫换件</Tag> : null}
+              {stat.pending > 0 ? <Tag color="orange">{stat.pending} 条字位待按新件复核</Tag> : null}
+            </Space>
+          }
+        />
+      ) : null}
+
       {baselineId ? (
         <Alert
           style={{ marginTop: 14 }}
           type={diff.diffCount > 0 ? 'warning' : 'success'}
           showIcon
-          message={`与基准拓本差异 ${diff.diffCount} 字（仅当前 ${diff.result.onlyACount} / 仅基准 ${diff.result.onlyBCount} / 程度不同 ${diff.result.severityDiffCount}）`}
+          message={`与基准拓本差异 ${diff.diffCount} 字（仅当前 ${diff.result.onlyACount} / 仅基准 ${diff.result.onlyBCount} / 程度不同 ${diff.result.severityDiffCount}）${
+            diff.result.excludedCount > 0 ? `；另有 ${diff.result.excludedCount} 处因缺页页序对不齐未计入` : ''
+          }`}
           description="网格中虚线框标记的字位即为差异字位；可在版本比对页生成正式比对记录。"
         />
       ) : null}
@@ -373,16 +470,20 @@ export default function LossBoard() {
                     return (
                       <div
                         key={charNo}
-                        className={`gb-loss-cell${loss ? ' is-marked' : ' is-empty'}${isDiff ? ' is-diff' : ''}`}
-                        style={loss ? { background: LOSS_TYPE_COLOR[loss.type] } : undefined}
+                        className={`gb-loss-cell${loss ? ' is-marked' : ' is-empty'}${isDiff ? ' is-diff' : ''}${
+                          loss?.reviewState === 'pending' ? ' is-pending' : ''
+                        }`}
+                        style={loss && loss.reviewState !== 'pending' ? { background: LOSS_TYPE_COLOR[loss.type] } : undefined}
                         title={
                           loss
-                            ? `${encodeCoord(lineNo, charNo)}　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}${loss.note ? `　${loss.note}` : ''}`
+                            ? `${encodeCoord(lineNo, charNo)}（第 ${loss.pageNo} 页）　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}${
+                                loss.reviewState === 'pending' ? '　待复核' : ''
+                              }${loss.note ? `　${loss.note}` : ''}`
                             : `${encodeCoord(lineNo, charNo)}　未标注`
                         }
                         onClick={() => (loss ? openEdit(loss) : openCreate(lineNo, charNo))}
                       >
-                        {loss ? LOSS_TYPE_LABEL[loss.type].slice(0, 1) : charNo}
+                        {loss ? (loss.reviewState === 'pending' ? '复' : LOSS_TYPE_LABEL[loss.type].slice(0, 1)) : charNo}
                       </div>
                     );
                   })}
@@ -390,7 +491,7 @@ export default function LossBoard() {
               ))}
             </div>
             <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
-              色块含义：{LOSS_TYPE_OPTIONS.map((item) => `${item.label}=${item.label.slice(0, 1)}`).join('　')}；虚线框为与基准拓本的差异字位。
+              色块含义：{LOSS_TYPE_OPTIONS.map((item) => `${item.label}=${item.label.slice(0, 1)}`).join('　')}；虚线框为与基准拓本的差异字位；「复」字格为重扫后待复核字位。
             </Typography.Text>
           </Card>
         </Col>
@@ -444,6 +545,15 @@ export default function LossBoard() {
             </Form.Item>
             <Form.Item name="charNo" label="字位" rules={[{ required: true }]} style={{ flex: 1 }}>
               <InputNumber min={1} max={80} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item
+              name="pageNo"
+              label="所在页"
+              rules={[{ required: true }]}
+              style={{ flex: 1 }}
+              tooltip="对应扫描影像件页序；落在待补扫页上的字位不计入版本差异字数"
+            >
+              <InputNumber min={1} max={999} style={{ width: '100%' }} />
             </Form.Item>
           </Space>
           <Space size={12} style={{ display: 'flex' }}>

@@ -61,16 +61,25 @@ export interface LossDiffRow {
   /** 差异类型：仅 A / 仅 B / 程度不同 / 一致 */
   diffKind: 'onlyA' | 'onlyB' | 'severity' | 'same';
   severityDelta: number;
+  /**
+   * 是否因缺页被排除在差异字数之外：
+   * 该字位所在页在 A / B 任一方属于待补扫缺页时，页序本身对不齐，不能算版本差异。
+   */
+  excluded: boolean;
+  /** 排除原因（缺页方与页码） */
+  excludedReason: string;
 }
 
 export interface LossDiffResult {
   rows: LossDiffRow[];
-  /** 差异字数：仅 A + 仅 B + 程度不同 */
+  /** 差异字数：仅 A + 仅 B + 程度不同（已剔除缺页字位，缺页不会让比对结果失真） */
   diffCount: number;
   onlyACount: number;
   onlyBCount: number;
   severityDiffCount: number;
   sameCount: number;
+  /** 因页序缺失被排除的差异字位数（不计入 diffCount，单独挂出提示） */
+  excludedCount: number;
   /** 涉及的拓本损泐总条数 */
   totalA: number;
   totalB: number;
@@ -82,11 +91,26 @@ function heaviest(list: Loss[]): Loss | null {
   return [...list].sort((a, b) => severityWeight(b.severity) - severityWeight(a.severity))[0] ?? null;
 }
 
+export interface DiffLossesOptions {
+  /** A 拓本待补扫的页序集合（页序缺的那几处） */
+  missingPagesA?: ReadonlySet<number>;
+  /** B 拓本待补扫的页序集合 */
+  missingPagesB?: ReadonlySet<number>;
+}
+
 /**
  * 按字位坐标比对两个拓本的损泐集合，输出差异清单与差异计数。
  * 差异定义：一方有损泐另一方没有，或双方损泐严重程度不同。
+ * 任一方该页缺扫时，字位所在页序对不齐，该行标记 excluded 且不计入差异字数。
  */
-export function diffLosses(lossesA: Loss[], lossesB: Loss[]): LossDiffResult {
+export function diffLosses(
+  lossesA: Loss[],
+  lossesB: Loss[],
+  options: DiffLossesOptions = {},
+): LossDiffResult {
+  const missingPagesA = options.missingPagesA ?? new Set<number>();
+  const missingPagesB = options.missingPagesB ?? new Set<number>();
+
   const mapA = new Map<string, Loss[]>();
   const mapB = new Map<string, Loss[]>();
   lossesA.forEach((loss) => {
@@ -116,12 +140,52 @@ export function diffLosses(lossesA: Loss[], lossesB: Loss[]): LossDiffResult {
     if (lossA && !lossB) diffKind = 'onlyA';
     else if (!lossA && lossB) diffKind = 'onlyB';
     else if (severityDelta !== 0) diffKind = 'severity';
-    return { key, lineNo, charNo, lossA, lossB, diffKind, severityDelta };
+
+    // 缺页排除优先于 diffKind：即便双方坐标上都有标注，只要页序对不齐（缺扫 / 页码错位），
+    // 该字位就不能作为版本差异依据。
+    const pageA = lossA?.pageNo;
+    const pageB = lossB?.pageNo;
+    const reasons: string[] = [];
+    let excluded = false;
+    if (pageA !== undefined && missingPagesA.has(pageA)) {
+      excluded = true;
+      reasons.push(`A 缺第 ${pageA} 页`);
+    }
+    if (pageB !== undefined && missingPagesB.has(pageB)) {
+      excluded = true;
+      reasons.push(`B 缺第 ${pageB} 页`);
+    }
+    if (lossA && !lossB && pageA !== undefined && missingPagesB.has(pageA)) {
+      excluded = true;
+      reasons.push(`B 缺第 ${pageA} 页，无法核对`);
+    }
+    if (lossB && !lossA && pageB !== undefined && missingPagesA.has(pageB)) {
+      excluded = true;
+      reasons.push(`A 缺第 ${pageB} 页，无法核对`);
+    }
+    if (pageA !== undefined && pageB !== undefined && pageA !== pageB) {
+      excluded = true;
+      reasons.push(`页序错位（A 第 ${pageA} 页 / B 第 ${pageB} 页）`);
+    }
+
+    return {
+      key,
+      lineNo,
+      charNo,
+      lossA,
+      lossB,
+      diffKind,
+      severityDelta,
+      excluded,
+      excludedReason: Array.from(new Set(reasons)).join('、'),
+    };
   });
 
-  const onlyACount = rows.filter((row) => row.diffKind === 'onlyA').length;
-  const onlyBCount = rows.filter((row) => row.diffKind === 'onlyB').length;
-  const severityDiffCount = rows.filter((row) => row.diffKind === 'severity').length;
+  const countable = rows.filter((row) => !row.excluded);
+  const onlyACount = countable.filter((row) => row.diffKind === 'onlyA').length;
+  const onlyBCount = countable.filter((row) => row.diffKind === 'onlyB').length;
+  const severityDiffCount = countable.filter((row) => row.diffKind === 'severity').length;
+  const excludedCount = rows.filter((row) => row.excluded).length;
 
   return {
     rows,
@@ -130,6 +194,7 @@ export function diffLosses(lossesA: Loss[], lossesB: Loss[]): LossDiffResult {
     onlyBCount,
     severityDiffCount,
     sameCount: rows.filter((row) => row.diffKind === 'same').length,
+    excludedCount,
     totalA: lossesA.length,
     totalB: lossesB.length,
   };
@@ -150,10 +215,10 @@ export function matchConclusion(result: LossDiffResult): CompareConclusion {
   return scoreB > scoreA ? 'early' : 'late';
 }
 
-/** 差异清单文本，用于编目卡与比对记录 */
+/** 差异清单文本，用于编目卡与比对记录（缺页排除项单列说明，不混进差异字数） */
 export function describeDiffRows(result: LossDiffResult, limit = 20): string[] {
   return result.rows
-    .filter((row) => row.diffKind !== 'same')
+    .filter((row) => row.diffKind !== 'same' && !row.excluded)
     .slice(0, limit)
     .map((row) => {
       const a = row.lossA

@@ -8,6 +8,7 @@ import { App as AntdApp, Badge, Button, Layout, Menu, Space, Tag, Typography } f
 import {
   AppstoreOutlined,
   BookOutlined,
+  CameraOutlined,
   DiffOutlined,
   ExportOutlined,
   FileSearchOutlined,
@@ -17,7 +18,8 @@ import { ROUTES } from './router';
 import { loadAll, useAppDispatch, useAppSelector } from './stores/store';
 import { selectSteles } from './stores/steleSlice';
 import { selectRubbings } from './stores/rubbingSlice';
-import { selectLosses } from './stores/lossSlice';
+import { selectLosses, selectPendingLosses } from './stores/lossSlice';
+import { selectMissingPages, selectScanBatches } from './stores/scanSlice';
 import { initDatabase } from './utils/db';
 import { STELE_FORM_LABEL } from './types/stele';
 
@@ -32,6 +34,9 @@ export default function App() {
   const steles = useAppSelector(selectSteles);
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
+  const pendingLosses = useAppSelector(selectPendingLosses);
+  const scanBatches = useAppSelector(selectScanBatches);
+  const missingPages = useAppSelector(selectMissingPages);
   const currentSteleId = useAppSelector((state) => state.stele.currentSteleId);
 
   useEffect(() => {
@@ -52,15 +57,17 @@ export default function App() {
   }, [dispatch, message]);
 
   const currentStele = steles.find((stele) => stele.id === currentSteleId) ?? null;
-  const selectedKey = location.pathname.startsWith('/rubbings')
-    ? ROUTES.rubbings
-    : location.pathname.startsWith('/losses')
-      ? ROUTES.losses
-      : location.pathname.startsWith('/compare')
-        ? ROUTES.compare
-        : location.pathname.startsWith('/export')
-          ? ROUTES.export
-          : ROUTES.steles;
+  const selectedKey = location.pathname.startsWith('/scans')
+    ? ROUTES.scans
+    : location.pathname.startsWith('/rubbings')
+      ? ROUTES.rubbings
+      : location.pathname.startsWith('/losses')
+        ? ROUTES.losses
+        : location.pathname.startsWith('/compare')
+          ? ROUTES.compare
+          : location.pathname.startsWith('/export')
+            ? ROUTES.export
+            : ROUTES.steles;
 
   return (
     <Layout style={{ minHeight: '100vh', background: 'transparent' }}>
@@ -81,6 +88,7 @@ export default function App() {
           onClick={({ key }) => navigate(key)}
           items={[
             { key: ROUTES.steles, icon: <AppstoreOutlined />, label: '碑刻台账' },
+            { key: ROUTES.scans, icon: <CameraOutlined />, label: '扫描批次' },
             { key: ROUTES.rubbings, icon: <PrinterOutlined />, label: '拓本登记' },
             { key: ROUTES.losses, icon: <BookOutlined />, label: '损泐字位' },
             { key: ROUTES.compare, icon: <DiffOutlined />, label: '版本比对' },
@@ -94,6 +102,15 @@ export default function App() {
             </span>
             <span>拓本 {rubbings.length} 份</span>
             <span>损泐字位 {losses.length} 条</span>
+            <span>
+              <CameraOutlined /> 扫描批次 {scanBatches.length} 批
+            </span>
+            {pendingLosses.length > 0 ? <span style={{ color: '#e0b15c' }}>待复核字位 {pendingLosses.length} 条</span> : null}
+            {missingPages.filter((page) => page.state === 'open').length > 0 ? (
+              <span style={{ color: '#d98a7e' }}>
+                待补扫缺页 {missingPages.filter((page) => page.state === 'open').length} 处
+              </span>
+            ) : null}
           </Space>
         </div>
       </Sider>

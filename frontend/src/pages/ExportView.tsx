@@ -34,8 +34,10 @@ import { loadAll } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import { selectRubbings } from '@/stores/rubbingSlice';
 import { selectCompares, selectLosses } from '@/stores/lossSlice';
+import { selectMissingPages, selectScanImages } from '@/stores/scanSlice';
 import { SEAL_TYPE_COLOR, SEAL_TYPE_LABEL, sealPositionWeight, type Seal, type SealType } from '@/types/seal';
 import { RUBBING_METHOD_LABEL, RUBBING_STATE_LABEL } from '@/types/rubbing';
+import type { Stele } from '@/types/stele';
 import { COMPARE_CONCLUSION_COLOR, COMPARE_CONCLUSION_LABEL } from '@/types/compare';
 import {
   DB_NAME,
@@ -66,6 +68,8 @@ export default function ExportView() {
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
   const compares = useAppSelector(selectCompares);
+  const scanImages = useAppSelector(selectScanImages);
+  const missingPages = useAppSelector(selectMissingPages);
   const sealTable = useIdbTable<Seal>((database) => database.seals, { sortByUpdatedAt: false });
 
   const [steleId, setSteleId] = useState<string>('');
@@ -81,8 +85,10 @@ export default function ExportView() {
       losses,
       seals: sealTable.rows,
       compares,
+      scanImages,
+      missingPages,
     }),
-    [compares, losses, rubbings, sealTable.rows, steles],
+    [compares, losses, missingPages, rubbings, scanImages, sealTable.rows, steles],
   );
 
   const allCardsLength = useMemo(() => buildAllCatalogCards(context).length, [context]);
@@ -96,9 +102,11 @@ export default function ExportView() {
             losses,
             sealTable.rows,
             compares,
+            scanImages,
+            missingPages,
           )
         : '请选择碑刻。',
-    [compares, losses, rubbings, sealTable.rows, stele],
+    [compares, losses, missingPages, rubbings, scanImages, sealTable.rows, stele],
   );
 
   const stat = useMemo(
@@ -108,12 +116,14 @@ export default function ExportView() {
       losses: losses.length,
       seals: sealTable.rows.length,
       compares: compares.length,
+      scanImages: scanImages.length,
+      openMissing: missingPages.filter((page) => page.state === 'open').length,
       passPercent:
         compares.length === 0
           ? 0
           : Math.round((compares.filter((compare) => compare.conclusion !== 'pending').length / compares.length) * 100),
     }),
-    [compares, losses.length, rubbings.length, sealTable.rows.length, steles.length],
+    [compares, losses.length, missingPages, rubbings.length, scanImages.length, sealTable.rows.length, steles.length],
   );
 
   const handleExport = async (): Promise<void> => {
@@ -240,6 +250,8 @@ export default function ExportView() {
         <StatBadge label="损泐字位" value={stat.losses} suffix="条" tone="warning" />
         <StatBadge label="钤印" value={stat.seals} suffix="方" />
         <StatBadge label="比对记录" value={stat.compares} suffix="条" tone="danger" />
+        <StatBadge label="扫描影像件" value={stat.scanImages} suffix="件" tone="success" />
+        <StatBadge label="待补扫缺页" value={stat.openMissing} suffix="处" tone="warning" />
         <StatBadge label="已定断代占比" value={`${stat.passPercent}%`} percent={stat.passPercent} tone="success" />
       </div>
 
@@ -271,6 +283,8 @@ export default function ExportView() {
                       losses,
                       sealTable.rows,
                       compares,
+                      scanImages,
+                      missingPages,
                     );
                     message.success(`已导出 ${filename}`);
                   }}
@@ -290,22 +304,25 @@ export default function ExportView() {
                 <Button
                   size="small"
                   onClick={() => {
+                    const fallbackStele: Stele = {
+                      id: '',
+                      title: '全部碑刻',
+                      era: '',
+                      location: '',
+                      form: 'stele',
+                      sizeCm: '',
+                      calligrapher: '',
+                      createdAt: 0,
+                      updatedAt: 0,
+                    };
                     const filename = exportCatalogCard(
-                      steles[0] ?? {
-                        id: '',
-                        title: '全部碑刻',
-                        era: '',
-                        location: '',
-                        form: 'stele',
-                        sizeCm: '',
-                        calligrapher: '',
-                        createdAt: 0,
-                        updatedAt: 0,
-                      },
+                      fallbackStele,
                       rubbings,
                       losses,
                       sealTable.rows,
                       compares,
+                      scanImages,
+                      missingPages,
                     );
                     message.success(`已导出 ${filename}（含全部碑刻）`);
                   }}
@@ -354,7 +371,7 @@ export default function ExportView() {
           <Card title="整库导出" style={{ marginTop: 16 }}>
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
               <Typography.Text type="secondary">
-                导出文件包含 5 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+                导出文件包含 8 张业务表全量数据（含扫描批次、影像件与缺页台账）与结构版本号，可在其他设备通过「导入 JSON」还原。
               </Typography.Text>
               <Space wrap>
                 <Button icon={<CloudDownloadOutlined />} onClick={() => void handleExport()}>

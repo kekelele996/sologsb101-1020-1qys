@@ -9,6 +9,9 @@ export type LossType = 'missing' | 'crack' | 'blur' | 'stoneFlower';
 /** 严重程度：轻 / 中 / 重 */
 export type LossSeverity = 'light' | 'medium' | 'heavy';
 
+/** 复核状态：有效 / 待复核（重扫换件后，按旧件标的字位先挂出待复核） */
+export type LossReviewState = 'active' | 'pending';
+
 export interface Loss {
   id: string;
   /** 所属拓本 id */
@@ -23,11 +26,32 @@ export interface Loss {
   severity: LossSeverity;
   /** 释文备注 */
   note: string;
+  /** 所在页序（与扫描影像件页序对应）；v3 前的历史数据默认第 1 页 */
+  pageNo: number;
+  /** 复核状态：重扫换件后旧件标注整体置为 pending，复核确认后回到 active */
+  reviewState: LossReviewState;
+  /** 待复核原因（如「批次 SB-… 重扫第 3 页后挂起」） */
+  reviewReason: string;
+  /** 标注时对应的影像号（重扫后据此说明它是按旧件标的） */
+  markedImageNo: string;
   createdAt: number;
   updatedAt: number;
 }
 
-export type LossDraft = Omit<Loss, 'id' | 'createdAt' | 'updatedAt'>;
+export type LossDraft = Omit<
+  Loss,
+  'id' | 'createdAt' | 'updatedAt' | 'reviewState' | 'reviewReason' | 'markedImageNo'
+>;
+
+export const LOSS_REVIEW_STATE_LABEL: Record<LossReviewState, string> = {
+  active: '有效',
+  pending: '待复核',
+};
+
+export const LOSS_REVIEW_STATE_COLOR: Record<LossReviewState, string> = {
+  active: '#2f6f4f',
+  pending: '#c9963c',
+};
 
 export const LOSS_TYPE_LABEL: Record<LossType, string> = {
   missing: '缺字',
@@ -68,7 +92,7 @@ export const LOSS_SEVERITY_OPTIONS: ReadonlyArray<{ value: LossSeverity; label: 
   { value: 'heavy', label: '重' },
 ];
 
-export function createEmptyLossDraft(rubbingId: string, lineNo: number, charNo: number): LossDraft {
+export function createEmptyLossDraft(rubbingId: string, lineNo: number, charNo: number, pageNo = 1): LossDraft {
   return {
     rubbingId,
     lineNo,
@@ -76,5 +100,6 @@ export function createEmptyLossDraft(rubbingId: string, lineNo: number, charNo: 
     type: 'missing',
     severity: 'medium',
     note: '',
+    pageNo,
   };
 }

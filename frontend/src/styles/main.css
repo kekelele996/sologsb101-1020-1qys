@@ -312,6 +312,20 @@ body::before {
   outline-offset: 1px;
 }
 
+/* 重扫换件后挂出待复核的字位格 */
+.gb-loss-cell.is-pending {
+  color: #8a5a17;
+  background: repeating-linear-gradient(
+    45deg,
+    #f6e4bd,
+    #f6e4bd 5px,
+    #fff4d6 5px,
+    #fff4d6 10px
+  );
+  border-color: #c9963c;
+  font-weight: 700;
+}
+
 .gb-diff-pair {
   display: grid;
   grid-template-columns: 1fr 1fr;

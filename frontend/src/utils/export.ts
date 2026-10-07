@@ -14,6 +14,10 @@ import { SEAL_TYPE_LABEL, sealPositionWeight } from '@/types/seal';
 import { COMPARE_CONCLUSION_LABEL } from '@/types/compare';
 import { diffLosses, encodeCoord, sortLosses } from './collate';
 import type { RubbingSnapshot } from './db';
+import type { ScanImage } from '@/types/scanImage';
+import type { MissingPage } from '@/types/missingPage';
+import { deriveDigitization, formatPageNos } from './scan';
+import { DIGITIZE_STATE_LABEL } from '@/types/scanImage';
 
 export function download(filename: string, content: string, mime: string): void {
   const blob = new Blob([content], { type: mime });
@@ -44,13 +48,15 @@ function csvCell(value: string | number | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** 编目卡：一块碑刻 + 其拓本 + 损泐 + 钤印 + 比对结论 */
+/** 编目卡：一块碑刻 + 其拓本 + 损泐 + 钤印 + 比对结论 + 扫描数字化进度 */
 export function buildCatalogCard(
   stele: Stele,
   rubbings: Rubbing[],
   losses: Loss[],
   seals: Seal[],
   compares: Compare[],
+  scanImages: ScanImage[] = [],
+  missingPages: MissingPage[] = [],
 ): string {
   const lines: string[] = [];
   lines.push(`【碑帖编目卡】${stele.title}`);
@@ -66,14 +72,28 @@ export function buildCatalogCard(
       const rubbingSeals = seals
         .filter((seal) => seal.rubbingId === rubbing.id)
         .sort((a, b) => sealPositionWeight(a.position) - sealPositionWeight(b.position));
+      const digitization = deriveDigitization(
+        scanImages.filter((image) => image.rubbingId === rubbing.id),
+        missingPages.filter((page) => page.rubbingId === rubbing.id),
+      );
+      const pendingCount = rubbingLosses.filter((loss) => loss.reviewState === 'pending').length;
       lines.push(
         `第 ${rubbing.versionNo} 版　${RUBBING_METHOD_LABEL[rubbing.method]}　${INK_TONE_LABEL[rubbing.inkTone]}　${rubbing.paperType}　${rubbing.sizeCm || '尺寸未记'}　收藏号 ${rubbing.collectionNo || '未编'}　${rubbing.dateGuess || '年代待考'}　${RUBBING_STATE_LABEL[rubbing.state]}`,
+      );
+      lines.push(
+        `　数字化：${DIGITIZE_STATE_LABEL[digitization.state]}（有效 ${digitization.activeCount} / ${digitization.pageCount || '?'} 页${
+          digitization.missingPageNos.length > 0 ? `，缺 ${formatPageNos(digitization.missingPageNos)}` : ''
+        }${digitization.rescanCount > 0 ? `，重扫 ${digitization.rescanCount} 次` : ''}）${
+          pendingCount > 0 ? `　待复核字位 ${pendingCount} 条` : ''
+        }`,
       );
       lines.push(`　损泐字位（${rubbingLosses.length} 条）：`);
       if (rubbingLosses.length === 0) lines.push('　　无');
       rubbingLosses.forEach((loss) => {
         lines.push(
-          `　　${encodeCoord(loss.lineNo, loss.charNo)}　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}　${loss.note || ''}`,
+          `　　${encodeCoord(loss.lineNo, loss.charNo)}（第 ${loss.pageNo} 页）　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}${
+            loss.reviewState === 'pending' ? '　[待复核]' : ''
+          }　${loss.note || ''}`,
         );
       });
       lines.push(`　钤印（${rubbingSeals.length} 方）：`);
@@ -106,9 +126,15 @@ export function exportCatalogCard(
   losses: Loss[],
   seals: Seal[],
   compares: Compare[],
+  scanImages: ScanImage[] = [],
+  missingPages: MissingPage[] = [],
 ): string {
   const filename = `${stele.title}-编目卡-${stampSuffix()}.txt`;
-  download(filename, buildCatalogCard(stele, rubbings, losses, seals, compares), 'text/plain;charset=utf-8');
+  download(
+    filename,
+    buildCatalogCard(stele, rubbings, losses, seals, compares, scanImages, missingPages),
+    'text/plain;charset=utf-8',
+  );
   return filename;
 }
 
@@ -118,6 +144,8 @@ export interface ExportContext {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  scanImages: ScanImage[];
+  missingPages: MissingPage[];
 }
 
 /** 全部碑刻的编目卡合订文本 */
@@ -131,6 +159,8 @@ export function buildAllCatalogCards(context: ExportContext): string {
         context.losses,
         context.seals,
         context.compares,
+        context.scanImages,
+        context.missingPages,
       ),
     )
     .join('\n\n————————————————\n\n');
@@ -169,25 +199,38 @@ export function exportLossLedgerCsv(context: ExportContext): string {
   return filename;
 }
 
-/** 差异清单文本（比对页复制用） */
+/** 差异清单文本（比对页复制用；缺页字位不计入差异字数，单列说明） */
 export function buildDiffText(
   stele: Stele,
   rubbingA: Rubbing | undefined,
   rubbingB: Rubbing | undefined,
   lossesA: Loss[],
   lossesB: Loss[],
+  missingPageNosA: readonly number[] = [],
+  missingPageNosB: readonly number[] = [],
 ): string {
-  const result = diffLosses(lossesA, lossesB);
+  const result = diffLosses(lossesA, lossesB, {
+    missingPagesA: new Set(missingPageNosA),
+    missingPagesB: new Set(missingPageNosB),
+  });
   const lines: string[] = [
     `【版本差异清单】${stele.title}`,
     `A：第 ${rubbingA?.versionNo ?? '?'} 版（${rubbingA ? RUBBING_METHOD_LABEL[rubbingA.method] : '未知'}）　B：第 ${rubbingB?.versionNo ?? '?'} 版（${
       rubbingB ? RUBBING_METHOD_LABEL[rubbingB.method] : '未知'
     }）`,
     `差异合计 ${result.diffCount} 字：仅 A ${result.onlyACount} / 仅 B ${result.onlyBCount} / 程度不同 ${result.severityDiffCount}`,
-    '',
   ];
+  if (result.excludedCount > 0) {
+    lines.push(
+      `缺页未计入 ${result.excludedCount} 处：${result.rows
+        .filter((row) => row.excluded)
+        .map((row) => `${encodeCoord(row.lineNo, row.charNo)}（${row.excludedReason}）`)
+        .join('、')}`,
+    );
+  }
+  lines.push('');
   result.rows
-    .filter((row) => row.diffKind !== 'same')
+    .filter((row) => row.diffKind !== 'same' && !row.excluded)
     .forEach((row) => {
       lines.push(
         `${encodeCoord(row.lineNo, row.charNo)}　A：${

@@ -73,7 +73,10 @@ import {
   type SealType,
 } from '@/types/seal';
 import { selectLosses } from '@/stores/lossSlice';
+import { selectMissingPages, selectScanImages } from '@/stores/scanSlice';
 import LossTag from '@/components/common/LossTag';
+import DigitizeTag from '@/components/common/DigitizeTag';
+import { deriveDigitization, formatPageNos } from '@/utils/scan';
 
 const FILTER_KEYS = ['method', 'state'] as const;
 
@@ -88,6 +91,8 @@ export default function RubbingList() {
   const filtered = useAppSelector(selectFilteredRubbings);
   const seals = useAppSelector(selectSeals);
   const losses = useAppSelector(selectLosses);
+  const scanImages = useAppSelector(selectScanImages);
+  const missingPages = useAppSelector(selectMissingPages);
   const steleFilterId = useAppSelector((state) => state.rubbing.filters.steleId);
 
   const url = useFilterQuery(FILTER_KEYS);
@@ -130,6 +135,20 @@ export default function RubbingList() {
   }, [losses.length, rubbings, seals.length]);
 
   const steleTitle = (steleId: string): string => steles.find((stele) => stele.id === steleId)?.title ?? steleId;
+
+  const digitizeByRubbing = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof deriveDigitization>>();
+    rubbings.forEach((rubbing) => {
+      map.set(
+        rubbing.id,
+        deriveDigitization(
+          scanImages.filter((image) => image.rubbingId === rubbing.id),
+          missingPages.filter((page) => page.rubbingId === rubbing.id),
+        ),
+      );
+    });
+    return map;
+  }, [missingPages, rubbings, scanImages]);
 
   const nextVersionNo = (steleId: string): number => {
     const list = rubbings.filter((rubbing) => rubbing.steleId === steleId);
@@ -215,7 +234,27 @@ export default function RubbingList() {
     { title: '纸种', dataIndex: 'paperType', width: 100 },
     { title: '墨色', dataIndex: 'inkTone', width: 90, render: (value: InkTone) => INK_TONE_LABEL[value] },
     { title: '尺寸', dataIndex: 'sizeCm', width: 110, render: (value: string) => value || '未记' },
-    { title: '收藏号', dataIndex: 'collectionNo', width: 120, render: (value: string) => value || '未编' },
+    { title: '收藏号', dataIndex: 'collectionNo', width: 120, render: (value: string) => value || <Tag color="red">未编·无法认领批次</Tag> },
+    {
+      title: '数字化',
+      key: 'digitize',
+      width: 150,
+      render: (_value, record) => {
+        const info = digitizeByRubbing.get(record.id);
+        if (!info) return '—';
+        return (
+          <Space direction="vertical" size={0}>
+            <DigitizeTag
+              state={info.state}
+              detail={info.state === 'done' ? `共 ${info.pageCount} 页，页序凑齐` : `缺 ${formatPageNos(info.missingPageNos)}`}
+            />
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {info.activeCount} / {info.pageCount || '?'} 页
+            </Typography.Text>
+          </Space>
+        );
+      },
+    },
     { title: '年代判断', dataIndex: 'dateGuess', width: 120, render: (value: string) => value || '待考' },
     {
       title: '损泐 / 钤印',
